@@ -3,56 +3,76 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ============ CẤU HÌNH GAME MỚI ============ */
+/* =========================================================
+   CẤU HÌNH
+   ========================================================= */
 const API_URL = process.env.API_URL || 'https://wtxmd52.macminim6.online/v1/txmd5/sessions';
-const CACHE_TTL = 4000;
+const CACHE_TTL = 4000;          // cache 4s
+const FORCE_REFRESH_MS = 10000;  // nếu cache cũ > 10s → fetch lại
 
 let cache = { list: [], t: 0 };
 
-/* ============ ADAPTER: chuẩn hoá mọi format ============ */
+/* =========================================================
+   ADAPTER: chuẩn hoá dữ liệu từ API gốc
+   Chấp nhận nhiều format field khác nhau
+   ========================================================= */
 function normalizeItem(raw) {
   if (!raw) return null;
-  const id = Number(raw.id ?? raw.sessionId ?? raw.phien ?? 0);
-  // kết quả T/X — chấp nhận nhiều key
-  let kq = raw.resultTruyenThong ?? raw.result ?? raw.ketQua ?? raw.outcome ?? '';
-  kq = String(kq).toUpperCase().trim();
-  if (kq === 'T' || kq === 'TAI' || kq === 'BIG' || kq === '1') kq = 'TAI';
-  else if (kq === 'X' || kq === 'XIU' || kq === 'SMALL' || kq === '0') kq = 'XIU';
 
-  // dice — chấp nhận dices / dice / xucXac
-  let dices = raw.dices ?? raw.dice ?? raw.xucXac ?? raw.diceValues ?? [];
+  // ID phiên
+  const id = Number(raw.id ?? raw.sessionId ?? raw.phien ?? raw.session_id ?? 0);
+  if (!id) return null;
+
+  // Kết quả T/X
+  let kq = raw.resultTruyenThong ?? raw.result ?? raw.ketQua ?? raw.outcome ?? raw.result_tx ?? '';
+  kq = String(kq).toUpperCase().trim();
+  if (['T', 'TAI', 'BIG', '1', 'TÀI'].includes(kq)) kq = 'TAI';
+  else if (['X', 'XIU', 'SMALL', '0', 'XỈU'].includes(kq)) kq = 'XIU';
+
+  // Dice
+  let dices = raw.dices ?? raw.dice ?? raw.xucXac ?? raw.diceValues ?? raw.dice_values ?? [];
   if (typeof dices === 'string') {
     dices = dices.split(/[,\-\s]+/).map(Number).filter(n => !isNaN(n));
   }
   if (!Array.isArray(dices)) dices = [];
   dices = dices.map(Number).filter(n => !isNaN(n));
 
-  // point
-  let point = Number(raw.point ?? raw.diem ?? raw.total ?? 0);
+  // Point
+  let point = Number(raw.point ?? raw.diem ?? raw.total ?? raw.score ?? 0);
   if (!point && dices.length) point = dices.reduce((a, b) => a + b, 0);
 
-  // Nếu không có kq nhưng có dice → suy ra T/X (>=11 TAI)
+  // Nếu không có kq → suy ra từ point
   if (!kq && point) kq = point >= 11 ? 'TAI' : 'XIU';
 
-  if (!id || !kq) return null;
+  if (!kq) return null;
   return { id, result: kq, dices, point };
 }
 
+/* =========================================================
+   FETCH dữ liệu từ API gốc
+   ========================================================= */
 async function fetchHistory() {
   const now = Date.now();
   if (cache.list.length && now - cache.t < CACHE_TTL) return cache.list;
+
   try {
     const res = await axios.get(API_URL, {
       timeout: 8000,
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json' }
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'vi,en;q=0.9'
+      }
     });
+
     let raw = res.data?.list || (Array.isArray(res.data) ? res.data : []);
     const list = raw.map(normalizeItem).filter(Boolean);
     list.sort((a, b) => b.id - a.id); // mới nhất trước
+
     if (list.length) cache = { list, t: now };
     return list;
   } catch (e) {
-    console.error('fetch err:', e.message);
+    console.error('[fetch err]', e.message);
     return cache.list;
   }
 }
@@ -80,7 +100,6 @@ function zigzagLength(R) {
   return n;
 }
 
-// Lặp khối độ dài k: mỗi khối uniform, khối kề khác loại
 function repeatUniformBlocks(R, k) {
   if (R.length < k * 2) return 0;
   let blocks = 0, prev = null;
@@ -94,7 +113,6 @@ function repeatUniformBlocks(R, k) {
   return blocks;
 }
 
-// Pattern xen kẽ khối p1 / p2
 function repeatPattern(R, p1, p2) {
   let i = 0, phase = 0, cycles = 0;
   while (i < R.length) {
@@ -116,8 +134,7 @@ function countN(R, n) {
 }
 
 /* =========================================================
-   NHẬN DIỆN CẦU — deterministic
-   Mỗi cầu trả: {loai, name, doDai, duDoan, baseTin, ghiChu}
+   NHẬN DIỆN CẦU — 12 loại pattern
    ========================================================= */
 function detectPatterns(R) {
   const out = [];
@@ -180,7 +197,7 @@ function detectPatterns(R) {
     });
   }
 
-  // 5) KÉP 4-4 (nếu có)
+  // 5) KÉP 4-4
   const k4 = repeatUniformBlocks(R, 4);
   if (k4 >= 2) {
     const rn = runLength(R);
@@ -196,7 +213,6 @@ function detectPatterns(R) {
   for (const [p1, p2, ten] of [[1, 2, '1-2'], [2, 1, '2-1']]) {
     const p = repeatPattern(R, p1, p2);
     if (p.cycles >= 2 && p.consumed >= 3) {
-      // phần tử kế tiếp = phần tử cuối khối hiện tại (cùng phase)
       const lastType = R[p.consumed - 1];
       out.push({
         loai: 'kep12', name: `Cầu ${ten}`, doDai: p.cycles,
@@ -222,7 +238,7 @@ function detectPatterns(R) {
     }
   }
 
-  // 8) CẦU NGẮN (đảo liên tục 7 phiên)
+  // 8) CẦU NGẮN
   let changes = 0;
   const lim = Math.min(8, R.length);
   for (let i = 1; i < lim; i++) if (R[i] !== R[i - 1]) changes++;
@@ -235,7 +251,7 @@ function detectPatterns(R) {
     });
   }
 
-  // 9) CẦU GÃY (bệt 2 vừa gãy sang so le)
+  // 9) CẦU GÃY
   if (R.length >= 5 && R[0] === R[1] && R[1] !== R[2] && R[2] !== R[3] && R[3] !== R[4]) {
     out.push({
       loai: 'gay', name: 'Cầu gãy', doDai: 5,
@@ -269,7 +285,7 @@ function backtest(list, R) {
   const stats = {};
   const maxCheck = Math.min(50, list.length - 1);
   for (let i = 0; i < maxCheck; i++) {
-    const pastR = R.slice(i + 1); // lịch sử TRƯỚC phiên i
+    const pastR = R.slice(i + 1);
     if (pastR.length < 4) continue;
     const pats = detectPatterns(pastR);
     const actual = R[i];
@@ -288,7 +304,7 @@ function backtest(list, R) {
 }
 
 /* =========================================================
-   DỰ ĐOÁN — vote có trọng số, KHÔNG random
+   DỰ ĐOÁN — vote trọng số, KHÔNG random
    ========================================================= */
 function predict(list) {
   if (!list || list.length < 5) {
@@ -298,6 +314,7 @@ function predict(list) {
       chiTietCau: [], vote: { TAI: 0, XIU: 0 }, backtestTheoLoaiCau: {}
     };
   }
+
   const R = list.map(x => x.result);
   const pats = detectPatterns(R);
   const bt = backtest(list, R);
@@ -307,8 +324,6 @@ function predict(list) {
 
   for (const p of pats) {
     const b = bt[p.loai] || { winrate: 50, total: 0, dung: 0, sai: 0 };
-    // Trọng số deterministic:
-    // base (0..1) × winrate backtest (nếu >=5 mẫu, ngược lại 0.5) × hệ số độ dài
     const wr = b.total >= 5 ? b.winrate / 100 : 0.5;
     const base = Math.min(p.baseTin, 90) / 100;
     const lenBoost = 1 + Math.min(p.doDai, 10) / 25;
@@ -317,13 +332,9 @@ function predict(list) {
     if (p.duDoan === 'TAI') vTAI += w; else vXIU += w;
 
     chiTiet.push({
-      cau: p.name,
-      loai: p.loai,
-      duDoan: p.duDoan,
-      doTinCayGoc: Math.round(p.baseTin),
-      doDai: p.doDai,
-      ghiChu: p.ghiChu,
-      trongSo: +w.toFixed(2),
+      cau: p.name, loai: p.loai, duDoan: p.duDoan,
+      doTinCayGoc: Math.round(p.baseTin), doDai: p.doDai,
+      ghiChu: p.ghiChu, trongSo: +w.toFixed(2),
       backtest: { mau: b.total, dung: b.dung, sai: b.sai, winrate: b.winrate }
     });
   }
@@ -332,21 +343,16 @@ function predict(list) {
   const tong = vTAI + vXIU || 1;
   const lech = Math.abs(vTAI - vXIU) / tong;
 
-  // Confidence 50..90 (không random, chỉ map từ lech)
   let doTinCay = Math.round(50 + lech * 40);
-
-  // Nếu cầu mạnh nhất NGƯỢC với kết quả vote → trừ nhẹ
   const strong = chiTiet.slice().sort((a, b) => b.trongSo - a.trongSo)[0];
   if (strong && strong.duDoan !== duDoan) doTinCay -= 6;
   doTinCay = Math.max(50, Math.min(90, doTinCay));
 
-  // Cầu chính hiển thị = cầu có trọng số cao nhất CÙNG hướng với duDoan
   const cungHuong = chiTiet.filter(c => c.duDoan === duDoan).sort((a, b) => b.trongSo - a.trongSo);
   const chinh = cungHuong[0] || strong;
 
   return {
-    duDoan,
-    doTinCay,
+    duDoan, doTinCay,
     loaiCauChinh: chinh ? chinh.cau : 'Không rõ',
     phanTich: chinh ? chinh.ghiChu : 'Không có pattern rõ.',
     nenTheoHayBe: strong && strong.duDoan !== duDoan ? 'Cầu mạnh nhất NGƯỢC — cân nhắc BẺ' : 'Theo',
@@ -357,48 +363,49 @@ function predict(list) {
 }
 
 /* =========================================================
-   API
+   API /dunphi — JSON GỌN cho phiên kế tiếp
    ========================================================= */
 app.get('/dunphi', async (req, res) => {
   try {
+    if (req.query.fresh === '1' || Date.now() - cache.t > FORCE_REFRESH_MS) {
+      cache.t = 0;
+    }
     const list = await fetchHistory();
-    if (!list.length) return res.status(503).json({ error: 'Không lấy được dữ liệu', apiUrl: API_URL });
+    if (!list.length) {
+      return res.status(503).json({
+        error: 'Không lấy được dữ liệu từ API gốc',
+        apiGoc: API_URL,
+        goiY: 'Kiểm tra API gốc còn sống không, hoặc thử lại sau vài giây.'
+      });
+    }
 
     const latest = list[0];
     const nextId = latest.id + 1;
     const p = predict(list);
     const R = list.map(x => x.result);
     const rl = runLength(R);
-    const zz = zigzagLength(R);
+    const c20 = countN(R, 20);
 
     res.json({
-      apiGoc: API_URL,
-      phienTruoc: {
-        id: latest.id,
-        ketQua: latest.result,
-        dice: latest.dices,
-        point: latest.point
-      },
       phienDuDoan: nextId,
       duDoan: p.duDoan,
       doTinCay: p.doTinCay,
       loaiCauChinh: p.loaiCauChinh,
       phanTich: p.phanTich,
       nenTheoHayBe: p.nenTheoHayBe,
+      phienTruoc: {
+        id: latest.id,
+        ketQua: latest.result,
+        dice: latest.dices,
+        point: latest.point
+      },
       chiTietCau: p.chiTietCau,
       vote: p.vote,
-      thongKe: {
-        betHienTai: `${rl.type} x${rl.len}`,
-        soLe: `x${zz}`,
-        tai10: countN(R, 10).TAI, xiu10: countN(R, 10).XIU,
-        tai20: countN(R, 20).TAI, xiu20: countN(R, 20).XIU,
-        tai30: countN(R, 30).TAI, xiu30: countN(R, 30).XIU,
-        tongPhienCoDuLieu: R.length
+      thongKe20: {
+        tai: c20.TAI,
+        xiu: c20.XIU,
+        betHienTai: `${rl.type} x${rl.len}`
       },
-      backtestTheoLoaiCau: p.backtestTheoLoaiCau,
-      lichSuGanNhat: list.slice(0, 20).map(x => ({
-        id: x.id, ketQua: x.result, dice: x.dices, point: x.point
-      })),
       thoiGian: new Date().toISOString()
     });
   } catch (e) {
@@ -406,11 +413,24 @@ app.get('/dunphi', async (req, res) => {
   }
 });
 
+/* =========================================================
+   API /dun — HTML: 1 khung dự đoán lớn + bảng check thu gọn
+   ========================================================= */
 app.get('/dun', async (req, res) => {
   try {
+    if (req.query.fresh === '1' || Date.now() - cache.t > FORCE_REFRESH_MS) {
+      cache.t = 0;
+    }
     const list = await fetchHistory();
-    if (!list.length) return res.status(503).send('<h1>Không có dữ liệu</h1>');
+    if (!list.length) {
+      return res.status(503).send('<h1 style="color:red">Không có dữ liệu từ API gốc</h1>');
+    }
 
+    const latest = list[0];
+    const nextId = latest.id + 1;
+    const next = predict(list);
+
+    // Backtest check 40 phiên
     const rows = [];
     let dung = 0, sai = 0;
     const maxCheck = Math.min(40, list.length - 1);
@@ -434,72 +454,127 @@ app.get('/dun', async (req, res) => {
     }
     const tong = dung + sai;
     const tyLe = tong ? (dung / tong * 100).toFixed(1) : 0;
-    const next = predict(list);
-    const latest = list[0];
 
-    const html = `<!DOCTYPE html><html lang="vi"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="15">
-<title>Dự đoán LC79 v3</title>
+    const voteTotal = next.vote.TAI + next.vote.XIU || 1;
+    const taiPct = Math.round(next.vote.TAI / voteTotal * 100);
+    const xiuPct = 100 - taiPct;
+
+    const html = `<!DOCTYPE html>
+<html lang="vi"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="20">
+<title>Dự đoán LC79 — Phiên ${nextId}</title>
 <style>
-*{box-sizing:border-box}body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0b1220;color:#e2e8f0;margin:0;padding:16px}
-h1{font-size:20px;text-align:center;color:#38bdf8;margin:4px 0 16px}
-.card{background:#16213a;border-radius:12px;padding:16px;margin-bottom:14px;box-shadow:0 4px 12px rgba(0,0,0,.35)}
-.pred{text-align:center}.pred .lbl{font-size:13px;color:#94a3b8}
-.pred .val{font-size:44px;font-weight:800;margin:6px 0}.tai{color:#ef4444}.xiu{color:#22c55e}
-.conf{font-size:19px;font-weight:700;color:#facc15}
-.row{display:flex;flex-wrap:wrap;gap:10px;justify-content:space-between;font-size:13px;margin-top:8px;color:#cbd5e1}
-.stat{display:flex;gap:8px;flex-wrap:wrap;font-size:12px;margin-top:8px}
-.stat span{background:#243354;padding:4px 9px;border-radius:7px}
+*{box-sizing:border-box}
+body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0b1220;color:#e2e8f0;margin:0;padding:16px;max-width:720px;margin:0 auto}
+h1{font-size:18px;text-align:center;color:#38bdf8;margin:4px 0 16px}
+.hero{background:linear-gradient(135deg,#16213a,#1e2b4a);border-radius:16px;padding:24px;margin-bottom:16px;text-align:center;box-shadow:0 6px 20px rgba(0,0,0,.4);border:1px solid #243354}
+.hero .lbl{font-size:14px;color:#94a3b8;letter-spacing:.5px}
+.hero .phien{font-size:13px;color:#64748b;margin-top:2px}
+.hero .val{font-size:64px;font-weight:900;margin:12px 0;letter-spacing:2px;text-shadow:0 0 20px currentColor}
+.tai{color:#ef4444}.xiu{color:#22c55e}
+.hero .conf{font-size:22px;font-weight:800;color:#facc15;margin-top:4px}
+.hero .confBar{height:8px;background:#0f172a;border-radius:4px;margin:10px auto 0;max-width:280px;overflow:hidden}
+.hero .confFill{height:100%;background:linear-gradient(90deg,#facc15,#f97316);border-radius:4px}
+.hero .row{display:flex;flex-wrap:wrap;gap:12px;justify-content:space-between;font-size:13px;margin-top:14px;color:#cbd5e1;text-align:left}
+.hero .row b{color:#38bdf8}
+.hero .note{font-size:12px;color:#94a3b8;margin-top:10px;font-style:italic;line-height:1.5}
+.hero .prev{font-size:12px;color:#64748b;margin-top:12px;border-top:1px solid #243354;padding-top:10px}
+.card{background:#16213a;border-radius:12px;padding:14px;margin-bottom:12px;box-shadow:0 4px 12px rgba(0,0,0,.3)}
+.card h3{font-size:13px;color:#38bdf8;margin:0 0 10px;text-transform:uppercase;letter-spacing:.5px}
+.detail{font-size:12px;color:#cbd5e1;line-height:1.7}
+.detail b{color:#38bdf8}
+.vote{display:flex;gap:10px;margin-top:8px}
+.vote .bar{flex:1;background:#0f172a;border-radius:6px;overflow:hidden;height:28px;position:relative}
+.vote .bar .fill{height:100%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;transition:width .4s}
+.vote .tai .fill{background:linear-gradient(90deg,#dc2626,#ef4444)}
+.vote .xiu .fill{background:linear-gradient(90deg,#16a34a,#22c55e)}
+details{background:#16213a;border-radius:12px;padding:0;margin-bottom:12px;box-shadow:0 4px 12px rgba(0,0,0,.3)}
+details summary{cursor:pointer;padding:14px;font-size:14px;color:#38bdf8;font-weight:600;list-style:none}
+details summary::-webkit-details-marker{display:none}
+details summary::before{content:'▸ ';transition:.2s;display:inline-block}
+details[open] summary::before{content:'▾ '}
+details .body{padding:0 14px 14px}
 table{width:100%;border-collapse:collapse;font-size:12px}
 th,td{padding:7px 5px;text-align:center;border-bottom:1px solid #243354}
-th{color:#94a3b8;font-weight:600}.dung{color:#22c55e;font-weight:700}.sai{color:#ef4444;font-weight:700}
+th{color:#94a3b8;font-weight:600;font-size:11px}
+.dung{color:#22c55e;font-weight:700}.sai{color:#ef4444;font-weight:700}
 .badge{padding:2px 7px;border-radius:5px;font-weight:700;font-size:11px}
-.badge.tai{background:rgba(239,68,68,.22)}.badge.xiu{background:rgba(34,197,94,.22)}
-.summary{display:flex;gap:14px;justify-content:center;font-size:15px;flex-wrap:wrap}
-.summary b{color:#facc15}
-.small{font-size:11px;color:#64748b;text-align:center;margin-top:6px}
-.detail{font-size:12px;color:#cbd5e1;line-height:1.6}
-.detail b{color:#38bdf8}
-</style></head><body>
-<h1>🎲 Dự đoán LC79 v3 — Phiên ${latest.id + 1}</h1>
-<div class="card pred">
-  <div class="lbl">Dự đoán phiên tới (${latest.id + 1})</div>
+.badge.tai{background:rgba(239,68,68,.22)}
+.badge.xiu{background:rgba(34,197,94,.22)}
+.summaryBox{display:flex;gap:14px;justify-content:center;font-size:14px;flex-wrap:wrap;margin-bottom:10px}
+.summaryBox b{color:#facc15}
+.small{font-size:11px;color:#64748b;text-align:center;margin-top:8px;line-height:1.6}
+.small a{color:#38bdf8;text-decoration:none}
+</style></head>
+<body>
+
+<h1>🎲 Dự đoán LC79 — Phiên kế tiếp</h1>
+
+<!-- KHUNG DỰ ĐOÁN CHÍNH -->
+<div class="hero">
+  <div class="lbl">PHIÊN CẦN DỰ ĐOÁN</div>
+  <div class="phien">#${nextId}</div>
   <div class="val ${next.duDoan === 'TAI' ? 'tai' : 'xiu'}">${next.duDoan}</div>
   <div class="conf">Độ tin cậy: ${next.doTinCay}%</div>
+  <div class="confBar"><div class="confFill" style="width:${next.doTinCay}%"></div></div>
   <div class="row">
     <div><b>Cầu chính:</b> ${next.loaiCauChinh}</div>
     <div><b>Nên:</b> ${next.nenTheoHayBe}</div>
   </div>
-  <div class="small">${next.phanTich}</div>
-</div>
-<div class="card">
-  <div class="summary">
-    <div>Tổng check: <b>${tong}</b></div>
-    <div>Đúng: <b class="dung">${dung}</b></div>
-    <div>Sai: <b class="sai">${sai}</b></div>
-    <div>Tỷ lệ: <b>${tyLe}%</b></div>
+  <div class="note">${next.phanTich}</div>
+  <div class="prev">
+    Phiên trước #${latest.id} → <b class="${latest.result === 'TAI' ? 'tai' : 'xiu'}">${latest.result}</b>
+    (${latest.dices.join('-')} = ${latest.point} điểm)
   </div>
 </div>
+
+<!-- VOTE T/X -->
 <div class="card">
-  <div class="detail">
+  <h3>⚖️ Tổng hợp vote các cầu</h3>
+  <div class="vote">
+    <div class="bar tai"><div class="fill" style="width:${taiPct}%">TAI ${taiPct}%</div></div>
+    <div class="bar xiu"><div class="fill" style="width:${xiuPct}%">XIU ${xiuPct}%</div></div>
+  </div>
+  <div class="detail" style="margin-top:10px">
     ${next.chiTietCau.map(c => `<div>• <b>${c.cau}</b> → ${c.duDoan} (${c.doTinCayGoc}% | w=${c.trongSo}) | BT: ${c.backtest.dung}/${c.backtest.mau} = ${c.backtest.winrate}% — <i>${c.ghiChu}</i></div>`).join('')}
   </div>
 </div>
-<div class="card" style="overflow-x:auto">
-<table>
-<thead><tr><th>Phiên</th><th>Dice</th><th>Điểm</th><th>KQ</th><th>Dự đoán</th><th>Tin cậy</th><th>Cầu</th><th>Check</th></tr></thead>
-<tbody>
-${rows.map(r => `<tr>
-<td>${r.id}</td><td>${r.dice}</td><td>${r.point}</td>
-<td><span class="badge ${r.ketQua === 'TAI' ? 'tai' : 'xiu'}">${r.ketQua}</span></td>
-<td><span class="badge ${r.duDoan === 'TAI' ? 'tai' : 'xiu'}">${r.duDoan}</span></td>
-<td>${r.doTinCay}%</td>
-<td style="font-size:10px;color:#94a3b8">${r.loaiCau}</td>
-<td class="${r.check === 'ĐÚNG' ? 'dung' : 'sai'}">${r.check}</td>
-</tr>`).join('')}
-</tbody></table></div>
-<div class="small">Tự làm mới 15s • /dunphi (JSON) • /dun (HTML)</div>
+
+<!-- BẢNG CHECK THU GỌN -->
+<details>
+  <summary>📊 Kiểm tra đúng/sai 40 phiên gần nhất (${dung} đúng / ${sai} sai = ${tyLe}%)</summary>
+  <div class="body">
+    <div class="summaryBox">
+      <div>Tổng: <b>${tong}</b></div>
+      <div>Đúng: <b class="dung">${dung}</b></div>
+      <div>Sai: <b class="sai">${sai}</b></div>
+      <div>Tỷ lệ: <b>${tyLe}%</b></div>
+    </div>
+    <div style="overflow-x:auto">
+    <table>
+      <thead><tr><th>Phiên</th><th>Dice</th><th>Điểm</th><th>KQ</th><th>Dự đoán</th><th>Tin cậy</th><th>Cầu</th><th>Check</th></tr></thead>
+      <tbody>
+        ${rows.map(r => `<tr>
+          <td>${r.id}</td><td>${r.dice}</td><td>${r.point}</td>
+          <td><span class="badge ${r.ketQua === 'TAI' ? 'tai' : 'xiu'}">${r.ketQua}</span></td>
+          <td><span class="badge ${r.duDoan === 'TAI' ? 'tai' : 'xiu'}">${r.duDoan}</span></td>
+          <td>${r.doTinCay}%</td>
+          <td style="font-size:10px;color:#94a3b8">${r.loaiCau}</td>
+          <td class="${r.check === 'ĐÚNG' ? 'dung' : 'sai'}">${r.check}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>
+    </div>
+  </div>
+</details>
+
+<div class="small">
+  Tự làm mới 20s • <a href="/dunphi?fresh=1" target="_blank">/dunphi</a> (JSON) • <a href="/dun?fresh=1">Làm mới ngay</a><br>
+  API gốc: ${API_URL}
+</div>
+
 </body></html>`;
     res.send(html);
   } catch (e) {
@@ -507,10 +582,28 @@ ${rows.map(r => `<tr>
   }
 });
 
-app.get('/', (req, res) => res.json({
-  api: 'LC79 Predictor v3 (deterministic, no random)',
-  apiGoc: API_URL,
-  endpoints: { '/dunphi': 'JSON chi tiết', '/dun': 'HTML check' }
-}));
+/* =========================================================
+   ROOT — info
+   ========================================================= */
+app.get('/', (req, res) => {
+  res.json({
+    api: 'LC79 Predictor v3 (deterministic, no random)',
+    apiGoc: API_URL,
+    endpoints: {
+      '/dunphi': 'JSON dự đoán phiên kế tiếp (thêm ?fresh=1 để force refresh)',
+      '/dun': 'HTML: khung dự đoán + bảng check đúng/sai (thêm ?fresh=1)'
+    }
+  });
+});
 
-app.listen(PORT, () => console.log('Server port ' + PORT + ' — API: ' + API_URL));
+/* =========================================================
+   START SERVER
+   ========================================================= */
+app.listen(PORT, () => {
+  console.log('=========================================');
+  console.log(`  LC79 Predictor v3`);
+  console.log(`  Port: ${PORT}`);
+  console.log(`  API gốc: ${API_URL}`);
+  console.log(`  Endpoints: /dunphi (JSON) | /dun (HTML)`);
+  console.log('=========================================');
+});
